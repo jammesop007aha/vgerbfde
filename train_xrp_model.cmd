@@ -9,7 +9,8 @@ set PYTHON_VERSION=3.10
 set PYTHONPATH=%PYTHONPATH%;%CD%
 
 :: Install Python dependencies (excluding TA-Lib for now)
-pip install pandas numpy scikit-learn xgboost pyarrow
+pip install pandas numpy scikit-learn xgboost pyarrow torch tqdm
+
 if errorlevel 1 exit /B 1
 
 :: Download TA-Lib C library
