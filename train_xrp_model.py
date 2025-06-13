@@ -1,198 +1,253 @@
+import ccxt
 import pandas as pd
 import numpy as np
-import torch
-import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-from sklearn.model_selection import TimeSeriesSplit
-from sklearn.metrics import classification_report
+from scipy.stats import pearsonr
+from statsmodels.tsa.stattools import grangercausalitytests, coint
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
+import talib
+import joblib
+import warnings
+import datetime
 import time
-from tqdm import tqdm  # For progress bar
 
-# =============== CONFIG ===============
-MERGED_PARQUET = 'xrp_till_april.parquet'
-MODEL_SAVE_PATH = 'xrp_transformer_model.pth'
-PREDICT_AHEAD = 5
-RETURN_THRESHOLD = 0.001
-SEQ_LENGTH = 60  # Lookback period (60 minutes)
-NUM_EPOCHS = 10
-NUM_FOLDS = 5
-BATCH_SIZE = 64
+# Suppress FutureWarning from statsmodels
+warnings.filterwarnings("ignore", category=FutureWarning, module="statsmodels")
 
-# =============== DATASET ===============
-class TradingDataset(Dataset):
-    def __init__(self, X, y, seq_length=SEQ_LENGTH):
-        self.X = torch.tensor(X.values, dtype=torch.float32)
-        self.y = torch.tensor(y.values, dtype=torch.long)
-        self.seq_length = seq_length
-        print(f"Dataset X shape: {self.X.shape}, y shape: {self.y.shape}")
+# Initialize Bybit exchange
+exchange = ccxt.bybit({'enableRateLimit': True})
 
-    def __len__(self):
-        return len(self.X) - self.seq_length
+# Define symbols and timeframe
+symbols = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'LINKUSDT', 'XRPUSDT', 'TONUSDT']
+timeframe = '5m'
+limit = 1000
+since = exchange.parse8601('2025-05-15T00:00:00Z')  # 30 days back
 
-    def __getitem__(self, idx):
-        return (self.X[idx:idx+self.seq_length], self.y[idx+self.seq_length-1])
+# Fetch OHLCV data
+def fetch_ohlcv(symbol, timeframe, since, limit):
+    all_data = []
+    while True:
+        try:
+            data = exchange.fetch_ohlcv(symbol, timeframe, since, limit)
+            if not data:
+                break
+            all_data += data
+            since = data[-1][0] + 1
+            time.sleep(0.1)
+        except Exception as e:
+            print(f"Error fetching {symbol}: {e}")
+            break
+    df = pd.DataFrame(all_data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    return df[['timestamp', 'open', 'high', 'low', 'close', 'volume']].set_index('timestamp')
 
-# =============== TRANSFORMER MODEL ===============
-class TimeSeriesTransformer(nn.Module):
-    def __init__(self, input_dim, num_classes, d_model=64, n_heads=4, n_layers=2, dropout=0.1):
-        super(TimeSeriesTransformer, self).__init__()
-        self.input_dim = input_dim
-        self.input_fc = nn.Linear(input_dim, d_model)
-        self.transformer = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(d_model, n_heads, dim_feedforward=256, dropout=dropout, batch_first=True),
-            num_layers=n_layers
-        )
-        self.fc = nn.Linear(d_model, num_classes)
-        self.dropout = nn.Dropout(dropout)
-        self.first_batch = True  # For debug print
+# Fetch funding rates
+def fetch_funding_rates(symbol, since, limit):
+    try:
+        funding = exchange.fetch_funding_rate_history(symbol, since=since, limit=limit)
+        df = pd.DataFrame(funding)
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df = df[['timestamp', 'fundingRate']].set_index('timestamp')
+        return df
+    except Exception as e:
+        print(f"Error fetching funding rates for {symbol}: {e}")
+        return pd.DataFrame()
 
-    def forward(self, x):
-        if self.first_batch:
-            print(f"Input shape to input_fc: {x.shape}")
-            self.first_batch = False
-        x = self.input_fc(x)  # [batch, seq_len, d_model]
-        x = self.transformer(x)  # [batch, seq_len, d_model]
-        x = x[:, -1, :]  # Take the last time step
-        x = self.dropout(x)
-        return self.fc(x)
+# Collect and process data
+dfs = []
+for symbol in symbols:
+    df = fetch_ohlcv(symbol, timeframe, since, limit)
+    funding_df = fetch_funding_rates(symbol, since, limit)
+    # Calculate indicators
+    df[f'{symbol}_rsi'] = talib.RSI(df['close'], timeperiod=14)
+    df[f'{symbol}_macd'], df[f'{symbol}_macd_signal'], _ = talib.MACD(df['close'], fastperiod=12, slowperiod=26, signalperiod=9)
+    df[f'{symbol}_bb_upper'], df[f'{symbol}_bb_middle'], df[f'{symbol}_bb_lower'] = talib.BBANDS(df['close'], timeperiod=20, nbdevup=2, nbdevdn=2)
+    df[f'{symbol}_atr'] = talib.ATR(df['high'], df['low'], df['close'], timeperiod=14)
+    df[f'{symbol}_obv'] = talib.OBV(df['close'], df['volume'])
+    df[f'{symbol}_slowk'], df[f'{symbol}_slowd'] = talib.STOCH(df['high'], df['low'], df['close'], fastk_period=14, slowk_period=3, slowd_period=3)
+    df[f'{symbol}_vwap'] = (df['close'] * df['volume']).cumsum() / df['volume'].cumsum()
+    df[f'{symbol}_momentum'] = talib.MOM(df['close'], timeperiod=10)
+    df[f'{symbol}_spread'] = df['high'] - df['low']
+    # Merge funding rates
+    if not funding_df.empty:
+        df = df.join(funding_df, how='left').fillna(method='ffill')
+        df.rename(columns={'fundingRate': f'{symbol}_funding_rate'}, inplace=True)
+    else:
+        df[f'{symbol}_funding_rate'] = np.nan
+    df = df[['close', 'volume', f'{symbol}_rsi', f'{symbol}_macd', f'{symbol}_macd_signal', 
+             f'{symbol}_bb_upper', f'{symbol}_bb_middle', f'{symbol}_bb_lower', f'{symbol}_atr', 
+             f'{symbol}_obv', f'{symbol}_slowk', f'{symbol}_slowd', f'{symbol}_vwap', 
+             f'{symbol}_momentum', f'{symbol}_spread', f'{symbol}_funding_rate']]
+    df.columns = [f"{symbol}_close", f"{symbol}_volume", f"{symbol}_rsi", f"{symbol}_macd", 
+                  f"{symbol}_macd_signal", f"{symbol}_bb_upper", f"{symbol}_bb_middle", 
+                  f"{symbol}_bb_lower", f"{symbol}_atr", f"{symbol}_obv", f"{symbol}_slowk", 
+                  f"{symbol}_slowd", f"{symbol}_vwap", f"{symbol}_momentum", f"{symbol}_spread", 
+                  f"{symbol}_funding_rate"]
+    dfs.append(df)
+    print(f"Fetched and processed data for {symbol}")
 
-# =============== DATA PREPARATION ===============
-def prepare_data(df):
-    df = df.copy()
-    expected_features = ['1m_open', '1m_high', '1m_low', '1m_close', '1m_volume']
-    missing_cols = [col for col in expected_features if col not in df.columns]
-    if missing_cols:
-        raise ValueError(f"Missing columns in DataFrame: {missing_cols}")
-    print(f"DataFrame columns: {df.columns.tolist()}")
+# Merge dataframes
+df = dfs[0]
+for d in dfs[1:]:
+    df = df.join(d, how='inner')
+df.dropna(inplace=True)
 
-    # Normalize raw inputs
-    features = expected_features
-    for col in features:
-        df[col] = (df[col] - df[col].mean()) / df[col].std()
+# Save data to Parquet
+df.to_parquet('many_data.parquet')
+print("Data saved to 'many_data.parquet'")
 
-    # Target
-    raw_target = df['1m_close'].pct_change(PREDICT_AHEAD).shift(-PREDICT_AHEAD)
-    df['target'] = np.where(raw_target > RETURN_THRESHOLD, 1, 
-                   np.where(raw_target < -RETURN_THRESHOLD, 0, np.nan))
-    df = df.dropna(subset=['target'])
-    df = df.ffill().dropna()
+# Calculate percentage returns and volatility
+returns = df[[f"{symbol}_close" for symbol in symbols]].pct_change().dropna()
+volatility = returns.std() * np.sqrt(12 * 24 * 365)  # Annualized volatility (12 candles/hour)
 
-    model_features = ['1m_open', '1m_high', '1m_low', '1m_volume']  # Exclude 1m_close for model input
-    print(f"Model features: {model_features}")
-    return df[model_features + ['1m_close']], df['target']
+# Pair-wise analysis
+corr_results = {}
+granger_results = {}
+coint_results = {}
+cross_corr_results = {}
+max_lag = 6  # 30 minutes
+for i, lead in enumerate(symbols):
+    for follow in symbols[i+1:]:
+        pair = f"{lead} vs {follow}"
+        # Correlation
+        corr, _ = pearsonr(returns[f"{lead}_close"], returns[f"{follow}_close"])
+        corr_results[pair] = corr
+        # Granger causality
+        try:
+            test_result = grangercausalitytests(
+                returns[[f"{lead}_close", f"{follow}_close"]], maxlag=max_lag, verbose=False
+            )
+            p_values = [test_result[i+1][0]['ssr_ftest'][1] for i in range(max_lag)]
+            min_p = min(p_values)
+            if min_p < 0.05:
+                granger_results[f"{lead} -> {follow}"] = min_p
+            test_result = grangercausalitytests(
+                returns[[f"{follow}_close", f"{lead}_close"]], maxlag=max_lag, verbose=False
+            )
+            p_values = [test_result[i+1][0]['ssr_ftest'][1] for i in range(max_lag)]
+            min_p = min(p_values)
+            if min_p < 0.05:
+                granger_results[f"{follow} -> {lead}"] = min_p
+        except:
+            continue
+        # Cointegration
+        try:
+            _, p_value, _ = coint(df[f"{lead}_close"], df[f"{follow}_close"])
+            if p_value < 0.05:
+                coint_results[pair] = p_value
+        except:
+            continue
+        # Cross-correlation
+        cross_corr = []
+        for lag in range(-max_lag, max_lag+1):
+            if lag < 0:
+                corr = returns[f"{lead}_close"].corr(returns[f"{follow}_close"].shift(-lag))
+            else:
+                corr = returns[f"{lead}_close"].shift(-lag).corr(returns[f"{follow}_close"])
+            cross_corr.append((lag, corr))
+        max_corr = max(cross_corr, key=lambda x: abs(x[1]), default=(0, 0))
+        if abs(max_corr[1]) > 0.3:  # Significant correlation threshold
+            cross_corr_results[pair] = max_corr
 
-# =============== TRAINING ===============
-def train_model(model, train_loader, criterion, optimizer, device, epoch, total_epochs):
-    model.train()
-    total_loss = 0
-    start_time = time.time()
-    for X_batch, y_batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{total_epochs}", leave=False):
-        X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-        optimizer.zero_grad()
-        output = model(X_batch)
-        loss = criterion(output, y_batch)
-        loss.backward()
-        optimizer.step()
-        total_loss += loss.item()
-    epoch_time = time.time() - start_time
-    return total_loss / len(train_loader), epoch_time
+# Train and save model for each coin
+models = {}
+for target_symbol in symbols:
+    # Prepare features
+    lagged_dfs = []
+    for symbol in symbols:
+        temp_df = pd.DataFrame()
+        for lag in range(1, 7):
+            temp_df[f"{symbol}_close_lag{lag}"] = df[f"{symbol}_close"].shift(lag)
+            temp_df[f"{symbol}_volume_lag{lag}"] = df[f"{symbol}_volume"].shift(lag)
+            temp_df[f"{symbol}_rsi_lag{lag}"] = df[f"{symbol}_rsi"].shift(lag)
+            temp_df[f"{symbol}_macd_lag{lag}"] = df[f"{symbol}_macd"].shift(lag)
+            temp_df[f"{symbol}_atr_lag{lag}"] = df[f"{symbol}_atr"].shift(lag)
+            temp_df[f"{symbol}_obv_lag{lag}"] = df[f"{symbol}_obv"].shift(lag)
+            temp_df[f"{symbol}_slowk_lag{lag}"] = df[f"{symbol}_slowk"].shift(lag)
+            temp_df[f"{symbol}_vwap_lag{lag}"] = df[f"{symbol}_vwap"].shift(lag)
+            temp_df[f"{symbol}_momentum_lag{lag}"] = df[f"{symbol}_momentum"].shift(lag)
+            temp_df[f"{symbol}_spread_lag{lag}"] = df[f"{symbol}_spread"].shift(lag)
+            temp_df[f"{symbol}_funding_rate_lag{lag}"] = df[f"{symbol}_funding_rate"].shift(lag)
+            temp_df[f"{symbol}_bb_width_lag{lag}"] = (df[f"{symbol}_bb_upper"] - df[f"{symbol}_bb_lower"]).shift(lag)
+        lagged_dfs.append(temp_df)
+    X = pd.concat(lagged_dfs, axis=1)
+    X.dropna(inplace=True)
+    # Target: Price direction
+    y = (returns[f"{target_symbol}_close"] > 0).astype(int).iloc[max_lag:]
+    X = X.iloc[max_lag:]
+    y = y[X.index]
+    # Train model
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    model = RandomForestClassifier(n_estimators=100, random_state=42)
+    model.fit(X_train, y_train)
+    accuracy = accuracy_score(y_test, model.predict(X_test))
+    feature_importance = pd.Series(model.feature_importances_, index=X.columns).sort_values(ascending=False)
+    models[target_symbol] = {
+        'model': model,
+        'accuracy': accuracy,
+        'top_features': feature_importance.head().to_dict()
+    }
+    # Save model
+    joblib.dump(model, f'rf_model_{target_symbol}.pkl')
+    print(f"Trained and saved model for {target_symbol}")
 
-# =============== ETA FORMATTER ===============
-def format_eta(seconds):
-    minutes = int(seconds // 60)
-    secs = int(seconds % 60)
-    return f"{minutes}m {secs}s"
+# Mean reversion and divergence
+mean_reversion_signals = {}
+divergence_signals = {}
+for i, coin1 in enumerate(symbols):
+    for coin2 in symbols[i+1:]:
+        pair = f"{coin1} vs {coin2}"
+        price_diff = df[f"{coin1}_close"] - df[f"{coin2}_close"].mean()
+        z_score = (price_diff - price_diff.mean()) / price_diff.std()
+        if z_score.abs().max() > 2:
+            mean_reversion_signals[pair] = z_score.abs().max()
+        if corr_results.get(pair, 0) < 0:
+            divergence_signals[pair] = corr_results[pair]
 
-# =============== MAIN ===============
-if __name__ == "__main__":
-    print("📂 Loading sol merged data...")
-    df = pd.read_parquet(MERGED_PARQUET).reset_index()
-    print(f"Initial DataFrame shape: {df.shape}")
-    X, y = prepare_data(df)
+# Save results to text file
+with open('crypto_relations.txt', 'w') as f:
+    f.write("Cryptocurrency Pair-wise Relationship Analysis\n")
+    f.write("=======================================\n\n")
+    
+    f.write("Volatility (Annualized, 5-min Returns):\n")
+    for symbol, vol in volatility.items():
+        f.write(f"{symbol}: {vol:.4f}\n")
+    f.write("\n")
+    
+    f.write("Pair-wise Analysis:\n")
+    for pair in corr_results:
+        f.write(f"\n{pair}:\n")
+        f.write(f"Correlation: {corr_results[pair]:.4f}\n")
+        lead = pair.split(' vs ')[0]
+        follow = pair.split(' vs ')[1]
+        if f"{lead} -> {follow}" in granger_results:
+            f.write(f"Granger Causality ({lead} -> {follow}): p-value = {granger_results[f'{lead} -> {follow}']:.4f}\n")
+        if f"{follow} -> {lead}" in granger_results:
+            f.write(f"Granger Causality ({follow} -> {lead}): p-value = {granger_results[f'{follow} -> {lead}']:.4f}\n")
+        if pair in coint_results:
+            f.write(f"Cointegration: p-value = {coint_results[pair]:.4f}\n")
+        if pair in cross_corr_results:
+            lag, corr = cross_corr_results[pair]
+            f.write(f"Max Cross-Correlation: Lag = {lag*5} minutes, Correlation = {corr:.4f}\n")
+        if pair in mean_reversion_signals:
+            f.write(f"Mean Reversion Opportunity: Max Z-score = {mean_reversion_signals[pair]:.2f}\n")
+        if pair in divergence_signals:
+            f.write(f"Divergence Opportunity: Correlation = {divergence_signals[pair]:.4f}\n")
+        f.write("Trading Strategy Implications:\n")
+        if corr_results[pair] > 0.7:
+            f.write("- High correlation: Consider trend-following or momentum strategies.\n")
+        if pair in coint_results:
+            f.write("- Cointegrated: Explore pairs trading or mean-reversion strategies.\n")
+        if f"{lead} -> {follow}" in granger_results or f"{follow} -> {lead}" in granger_results:
+            f.write("- Lead-lag detected: Monitor leading coin for trade signals.\n")
+    
+    f.write("\nModel Performance (Predicting Price Direction):\n")
+    for symbol, info in models.items():
+        f.write(f"\n{symbol}:\n")
+        f.write(f"Test Accuracy: {info['accuracy']:.4f}\n")
+        f.write("Top 5 Influential Features:\n")
+        for feat, imp in info['top_features'].items():
+            f.write(f"{feat}: {imp:.4f}\n")
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = TimeSeriesTransformer(input_dim=len(X.columns)-1, num_classes=2).to(device)
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-
-    tscv = TimeSeriesSplit(n_splits=NUM_FOLDS)
-    total_start_time = time.time()
-    epoch_times = []
-
-    for fold, (train_idx, test_idx) in enumerate(tscv.split(X)):
-        print(f"\n📊 Fold {fold + 1}/{NUM_FOLDS}")
-        X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
-        y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
-
-        train_dataset = TradingDataset(X_train.drop(columns=['1m_close']), y_train)
-        test_dataset = TradingDataset(X_test.drop(columns=['1m_close']), y_test)
-        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=False)
-        test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
-
-        # Reset first_batch flag for each fold
-        model.first_batch = True
-
-        # Train
-        fold_start_time = time.time()
-        for epoch in range(NUM_EPOCHS):
-            train_loss, epoch_time = train_model(model, train_loader, criterion, optimizer, device, epoch, NUM_EPOCHS)
-            epoch_times.append(epoch_time)
-
-            # Calculate ETA
-            avg_epoch_time = sum(epoch_times) / len(epoch_times)
-            remaining_epochs = (NUM_EPOCHS - (epoch + 1)) + (NUM_FOLDS - (fold + 1)) * NUM_EPOCHS
-            eta_seconds = avg_epoch_time * remaining_epochs
-            eta_str = format_eta(eta_seconds)
-
-            print(f"Epoch {epoch+1}/{NUM_EPOCHS}, Loss: {train_loss:.4f}, ETA: {eta_str}")
-
-        fold_time = time.time() - fold_start_time
-        print(f"Fold {fold + 1} completed in {format_eta(fold_time)}")
-
-        # Evaluate
-        model.eval()
-        preds, actuals = [], []
-        with torch.no_grad():
-            for X_batch, y_batch in test_loader:
-                X_batch = X_batch.to(device)
-                output = model(X_batch)
-                preds.extend(torch.argmax(output, dim=1).cpu().numpy())
-                actuals.extend(y_batch.numpy())
-
-        print("Classification Report:")
-        print(classification_report(actuals, preds, target_names=['Short', 'Long']))
-
-        # Trade Edge Calculation
-        df_test = df.iloc[test_idx].copy()
-        df_test['prediction'] = pd.Series(preds, index=X_test.index).map({0: -1, 1: 1})
-        df_test['actual_return'] = df_test['1m_close'].pct_change(PREDICT_AHEAD).shift(-PREDICT_AHEAD)
-
-        long_trades = df_test[df_test['prediction'] == 1]
-        short_trades = df_test[df_test['prediction'] == -1]
-
-        win_long = sum(long_trades['actual_return'] > RETURN_THRESHOLD) / len(long_trades) if len(long_trades) > 0 else 0
-        win_short = sum(short_trades['actual_return'] < -RETURN_THRESHOLD) / len(short_trades) if len(short_trades) > 0 else 0
-
-        avg_win_long = long_trades[long_trades['actual_return'] > 0]['actual_return'].mean() if len(long_trades[long_trades['actual_return'] > 0]) > 0 else 0
-        avg_loss_long = long_trades[long_trades['actual_return'] < 0]['actual_return'].mean() if len(long_trades[long_trades['actual_return'] < 0]) > 0 else 0
-        edge_long = (avg_win_long - abs(avg_loss_long) - 0.0004) * 10
-
-        avg_win_short = abs(short_trades[short_trades['actual_return'] < 0]['actual_return'].mean()) if len(short_trades[short_trades['actual_return'] < 0]) > 0 else 0
-        avg_loss_short = short_trades[short_trades['actual_return'] > 0]['actual_return'].mean() if len(short_trades[short_trades['actual_return'] > 0]) > 0 else 0
-        edge_short = (avg_win_short - avg_loss_short - 0.0004) * 10
-
-        print("Trade Edge Summary (10x Leverage):")
-        print(f"🟢 Long Win Rate: {win_long:.2%}")
-        print(f"🏆 Avg Win (Long): {avg_win_long*100*10:.3f}%")
-        print(f"🔻 Avg Loss (Long): {avg_loss_long*100*10:.3f}%")
-        print(f"📊 Net Edge (Long): {edge_long*100:.3f}%")
-        print(f"🔴 Short Win Rate: {win_short:.2%}")
-        print(f"🏆 Avg Win (Short): {avg_win_short*100*10:.3f}%")
-        print(f"🔻 Avg Loss (Short): {avg_loss_short*100*10:.3f}%")
-        print(f"📊 Net Edge (Short): {edge_short*100:.3f}%")
-
-    total_time = time.time() - total_start_time
-    print(f"\nTraining completed in {format_eta(total_time)}")
-    print("\n💾 Saving trained model...")
-    torch.save(model.state_dict(), MODEL_SAVE_PATH)
-    print(f"Model saved to {MODEL_SAVE_PATH}")
+print("Analysis complete. Data saved to 'many_data.parquet'. Models saved as 'rf_model_*.pkl'. Results saved to 'crypto_relations.txt'.")
