@@ -12,6 +12,7 @@ if errorlevel 1 exit /B 1
 
 
 :: Run the training script
+set PYTHONUTF8=1
 python train_xrp_model.py
 if errorlevel 1 exit /B 1
 
