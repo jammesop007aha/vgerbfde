@@ -177,7 +177,7 @@ if __name__ == "__main__":
         avg_loss_long = long_trades[long_trades['actual_return'] < 0]['actual_return'].mean() if len(long_trades[long_trades['actual_return'] < 0]) > 0 else 0
         edge_long = (avg_win_long - abs(avg_loss_long) - 0.0004) * 10
 
-        avg_win_short = abs(short  _trades[short_trades['actual_return'] < 0]['actual_return'].mean()) if len(short_trades[short_trades['actual_return'] < 0]) > 0 else 0
+        avg_win_short = abs(short_trades[short_trades['actual_return'] < 0]['actual_return'].mean()) if len(short_trades[short_trades['actual_return'] < 0]) > 0 else 0
         avg_loss_short = short_trades[short_trades['actual_return'] > 0]['actual_return'].mean() if len(short_trades[short_trades['actual_return'] > 0]) > 0 else 0
         edge_short = (avg_win_short - avg_loss_short - 0.0004) * 10
 
