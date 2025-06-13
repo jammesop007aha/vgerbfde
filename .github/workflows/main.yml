@@ -1,0 +1,64 @@
+name: Train XRP Model and Create Release
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+env:
+  TALIB_C_VER: 0.6.4
+  TALIB_PY_VER: 0.6.3
+
+jobs:
+  train_and_release:
+    name: Train XRP Model and Release Outputs
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        name: Checkout repository
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v3
+        with:
+          path: ~\AppData\Local\pip\Cache
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: amd64
+
+      - name: Run training script
+        run: train_xrp_model.cmd
+        shell: cmd
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: xrp-model-outputs
+          path: |
+            sol_transformer_model.pth
+
+      - name: Create GitHub Release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            sol_transformer_model.pth
+          tag_name: v${{ github.run_number }}
+          name: XRP Model Release v${{ github.run_number }}
+          body: |
+            Automated release of XRP trading model outputs.
+            Includes trained model, feature names, and feature importance.
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
